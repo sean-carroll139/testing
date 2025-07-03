@@ -13,7 +13,7 @@ mkdir -p "$DATA_FOLDER"
 > "$LOG_FILE"
 echo "Device,Serial Number,Health,Reallocated_Sector_Ct,Current_Pending_Sector,Offline_Uncorrectable" > "$CSV_FILE"
 
-# Deuteranopia-friendly color codes
+# Color codes for deuteranopia-friendly output
 BOLD="\033[1m"
 YELLOW="\033[1;33m"
 BLUE="\033[1;34m"
@@ -153,9 +153,23 @@ check_smartctl_drive() {
     return
   fi
 
-  if grep -E 'Reallocated_Sector_Ct|Current_Pending_Sector|Offline_Uncorrectable' /tmp/smart_output.txt | awk '{if ($2 ~ /^[0-9]+$/ && $10 > 0) print}' | grep -q '.'; then
-    warn "SMART warnings on $device"
-    grep -E 'Reallocated_Sector_Ct|Current_Pending_Sector|Offline_Uncorrectable' /tmp/smart_output.txt | tee -a "$LOG_FILE"
+  if grep -E 'Reallocated_Sector_Ct|Current_Pending_Sector|Offline_Uncorrectable|Reported_Uncorrect|Percent_Lifetime_Remain|Unexpect_Power_Loss_Ct|Write_Error_Rate|Program_Fail_Count|Erase_Fail_Count' /tmp/smart_output.txt |
+      awk '{
+        attr=$2
+        val=$10
+        if (val ~ /^[0-9]+$/ && (
+            (attr == "Reallocated_Sector_Ct"       && val > 0) ||
+            (attr == "Current_Pending_Sector"      && val > 0) ||
+            (attr == "Offline_Uncorrectable"       && val > 0) ||
+            (attr == "Reported_Uncorrect"          && val > 0) ||
+            (attr == "Write_Error_Rate"            && val > 0) ||
+            (attr == "Program_Fail_Count"          && val > 0) ||
+            (attr == "Erase_Fail_Count"            && val > 0) ||
+            (attr == "Percent_Lifetime_Remain"     && val <= 5) ||
+            (attr == "Unexpect_Power_Loss_Ct"      && val > 100)
+        )) print
+      }' | grep -q '.'; then
+    warn "SMART attribute issues detected on $device"
     BAD_DRIVES+=("$device")
   fi
 }
