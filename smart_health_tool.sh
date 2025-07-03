@@ -3,8 +3,6 @@
 LOG_FILE="/tmp/smartcheck.log"
 DATA_FOLDER="/smart/data"
 CSV_FILE="$DATA_FOLDER/summary.csv"
-EMAIL_RECIPIENT="sean.carroll@ahead.com"
-SUBJECT="SMART Health Check Failure Report - $(hostname)"
 BAD_DRIVES=()
 MAX_RAID_DISKS=32
 RAID_TOOLS=(storcli64 storcli perccli64 perccli ssacli)
@@ -28,20 +26,12 @@ install_required_packages() {
   if command -v apt-get &>/dev/null; then
     export DEBIAN_FRONTEND=noninteractive
     sudo apt-get update
-    for pkg in smartmontools mailutils postfix; do
-      if ! dpkg -s "$pkg" &>/dev/null; then
-        log "Installing $pkg..."
-        if [ "$pkg" = "postfix" ]; then
-          echo "postfix postfix/mailname string $(hostname)" | sudo debconf-set-selections
-          echo "postfix postfix/main_mailer_type string 'Internet Site'" | sudo debconf-set-selections
-        fi
-        sudo apt-get install -y "$pkg"
-      fi
-    done
-    sudo systemctl enable --now postfix
+    if ! dpkg -s smartmontools &>/dev/null; then
+      log "Installing smartmontools..."
+      sudo apt-get install -y smartmontools
+    fi
   elif command -v yum &>/dev/null; then
-    sudo yum install -y smartmontools mailx postfix
-    sudo systemctl enable --now postfix
+    sudo yum install -y smartmontools
   fi
 }
 
@@ -65,76 +55,6 @@ parse_and_log_csv() {
   local pending=$(grep -i "Current_Pending_Sector" /tmp/smart_output.txt | awk '{print $10}' | head -n1)
   local offline=$(grep -i "Offline_Uncorrectable" /tmp/smart_output.txt | awk '{print $10}' | head -n1)
   echo "$device,$serial,$health,${realloc:-0},${pending:-0},${offline:-0}" >> "$CSV_FILE"
-}
-
-send_alert_email() {
-  [ ${#BAD_DRIVES[@]} -eq 0 ] && return
-
-  log "Sending HTML-formatted alert email to $EMAIL_RECIPIENT..."
-  local html_body="/tmp/smart_email_body.html"
-  local boundary="smart-check-$(date +%s)"
-
-  cat <<EOF > "$html_body"
-Subject: $SUBJECT
-MIME-Version: 1.0
-Content-Type: multipart/mixed; boundary="$boundary"
-
---$boundary
-Content-Type: text/html; charset="UTF-8"
-Content-Transfer-Encoding: 7bit
-
-<html>
-  <body style="font-family:sans-serif; color:#000;">
-    <h2 style="color:#003366;">SMART Health Report - $(hostname)</h2>
-    <p><strong>Detected Issues:</strong></p>
-    <table border="1" cellpadding="6" cellspacing="0" style="border-collapse:collapse; font-size:14px;">
-      <thead style="background-color:#003366; color:#fff;">
-        <tr>
-          <th>Device</th>
-          <th>Serial</th>
-          <th>Health</th>
-          <th>Reallocated</th>
-          <th>Pending</th>
-          <th>Uncorrectable</th>
-        </tr>
-      </thead>
-      <tbody>
-EOF
-
-  tail -n +2 "$CSV_FILE" | while IFS=',' read -r dev serial health realloc pend uncorrect; do
-    color="#009900"
-    [[ "$health" =~ FAIL ]] && color="#cc0000"
-    [[ "$realloc" -gt 0 || "$pend" -gt 0 || "$uncorrect" -gt 0 ]] && color="#ff9900"
-    cat <<ROW >> "$html_body"
-        <tr>
-          <td>$dev</td>
-          <td>$serial</td>
-          <td style="color:$color;"><strong>$health</strong></td>
-          <td align="center">$realloc</td>
-          <td align="center">$pend</td>
-          <td align="center">$uncorrect</td>
-        </tr>
-ROW
-  done
-
-  cat <<EOF >> "$html_body"
-      </tbody>
-    </table>
-    <p style="margin-top:20px;">Full reports saved to: <code>$DATA_FOLDER</code></p>
-  </body>
-</html>
-
---$boundary
-Content-Type: text/csv; name="summary.csv"
-Content-Transfer-Encoding: base64
-Content-Disposition: attachment; filename="summary.csv"
-
-EOF
-
-  base64 "$CSV_FILE" >> "$html_body"
-  echo "--$boundary--" >> "$html_body"
-
-  sendmail -t < "$html_body"
 }
 
 check_smartctl_drive() {
@@ -219,8 +139,6 @@ summary() {
   else
     crit "Drives with SMART warnings or failures:"
     for bad in "${BAD_DRIVES[@]}"; do echo " - $bad" | tee -a "$LOG_FILE"; done
-    send_alert_email
-    exit 1
   fi
 }
 
