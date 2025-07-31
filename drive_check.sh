@@ -2,22 +2,24 @@
 
 # Requires: smartmontools, sudo/root access
 
-OUTPUT="drive_check_summary_$(hostname)_$(date +%Y%m%d_%H%M%S).csv"
-HEADER="Drive,Device Node,SMART Health,DMESG Errors"
+TIMESTAMP=$(date +%Y%m%d_%H%M%S)
+OUTPUT="drive_check_summary_$(hostname)_$TIMESTAMP.csv"
+TMP_ERROR_LOG="/tmp/dmesg_drive_errors_$TIMESTAMP.log"
 
-echo "$HEADER" | tee "$OUTPUT"
+# CSV Header
+echo "Drive,Device Node,SMART Health,DMESG Error Count" | tee "$OUTPUT"
 
-echo "Scanning for drives..."
+echo -e "\nScanning drives...\n"
 
-# Get list of disk devices (e.g., /dev/sda, /dev/nvme0n1)
+# Find all physical drives
 mapfile -t DRIVES < <(lsblk -dno NAME,TYPE | awk '$2 == "disk" {print "/dev/" $1}')
 
 for DEV in "${DRIVES[@]}"; do
-    # Try to get serial number or label
+    # Get serial number or fallback to device name
     DRIVE_LABEL=$(udevadm info --query=all --name="$DEV" | grep ID_SERIAL= | cut -d= -f2)
     [[ -z "$DRIVE_LABEL" ]] && DRIVE_LABEL=$(basename "$DEV")
 
-    # SMART health check
+    # SMART Health Status
     if smartctl -H "$DEV" &>/dev/null; then
         SMART_HEALTH=$(smartctl -H "$DEV" | grep "SMART overall-health" | awk -F: '{gsub(/^[ \t]+/, "", $2); print $2}')
         [[ -z "$SMART_HEALTH" ]] && SMART_HEALTH="UNKNOWN"
@@ -25,12 +27,30 @@ for DEV in "${DRIVES[@]}"; do
         SMART_HEALTH="NOT SUPPORTED"
     fi
 
-    # Count relevant dmesg errors
-    DMESG_ERRORS=$(dmesg | grep -iE "$DEV|$(basename "$DEV")" | grep -iE "error|fail|reset|timeout" | wc -l)
+    # Collect dmesg errors for this device
+    grep -iE "$DEV|$(basename "$DEV")" /var/log/dmesg 2>/dev/null | \
+        grep -iE "error|fail|reset|timeout" > "$TMP_ERROR_LOG"
+    if [[ ! -s $TMP_ERROR_LOG ]]; then
+        dmesg | grep -iE "$DEV|$(basename "$DEV")" | \
+            grep -iE "error|fail|reset|timeout" > "$TMP_ERROR_LOG"
+    fi
+    DMESG_COUNT=$(wc -l < "$TMP_ERROR_LOG")
 
-    # Compose line and print + save
-    LINE="$DRIVE_LABEL,$DEV,$SMART_HEALTH,$DMESG_ERRORS"
-    echo "$LINE" | tee -a "$OUTPUT"
+    # Print summary line
+    SUMMARY_LINE="$DRIVE_LABEL,$DEV,$SMART_HEALTH,$DMESG_COUNT"
+    echo "$SUMMARY_LINE" | tee -a "$OUTPUT"
+
+    # If errors found, print them under the summary
+    if [[ "$DMESG_COUNT" -gt 0 ]]; then
+        echo "---------------" | tee -a "$OUTPUT"
+        cat "$TMP_ERROR_LOG" | tee -a "$OUTPUT"
+        echo "---------------" | tee -a "$OUTPUT"
+    fi
+
+    echo "" | tee -a "$OUTPUT"
 done
 
-echo -e "\nScan complete. Summary saved to: $OUTPUT"
+# Clean up
+rm -f "$TMP_ERROR_LOG"
+
+echo "Scan complete. Report saved to: $OUTPUT"
