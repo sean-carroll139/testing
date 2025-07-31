@@ -1,46 +1,95 @@
 #!/bin/bash
 
-# Requires: smartmontools, sudo/root access
+# Description: Drive health check script with SMART and dmesg parsing.
+# Output: CSV + human-readable terminal summary.
+# Usage: Run as root.
 
 TIMESTAMP=$(date +%Y%m%d_%H%M%S)
-OUTPUT="drive_check_summary_$(hostname)_$TIMESTAMP.csv"
+HOSTNAME=$(hostname)
+OUTPUT="drive_check_summary_${HOSTNAME}_$TIMESTAMP.csv"
 TMP_ERROR_LOG="/tmp/dmesg_drive_errors_$TIMESTAMP.log"
 
-# CSV Header
 echo "Drive,Device Node,SMART Health,DMESG Error Count" | tee "$OUTPUT"
-
 echo -e "\nScanning drives...\n"
 
-# Find all physical drives
+# Get all /dev/sdX devices
 mapfile -t DRIVES < <(lsblk -dno NAME,TYPE | awk '$2 == "disk" {print "/dev/" $1}')
 
 for DEV in "${DRIVES[@]}"; do
-    # Get serial number or fallback to device name
-    DRIVE_LABEL=$(udevadm info --query=all --name="$DEV" | grep ID_SERIAL= | cut -d= -f2)
+    ###############################
+    # Robust Serial Number Detection
+    ###############################
+    DRIVE_LABEL=""
+    SERIAL_OUT=""
+    MODES=("" "sat" "scsi" "ata" "auto")
+
+    for MODE in "${MODES[@]}"; do
+        if [[ -z "$SERIAL_OUT" ]]; then
+            if [[ -z "$MODE" ]]; then
+                SERIAL_OUT=$(smartctl -i "$DEV" 2>/dev/null)
+            else
+                SERIAL_OUT=$(smartctl -i -d "$MODE" "$DEV" 2>/dev/null)
+            fi
+        fi
+
+        # Exit early if serial found
+        if echo "$SERIAL_OUT" | grep -iqE 'serial|s/n'; then
+            break
+        fi
+    done
+
+    # Try to extract serial number
+    DRIVE_LABEL=$(echo "$SERIAL_OUT" | awk -F: '
+    /[Ss]erial[ _]*[Nn]umber|S\/N/ {
+        gsub(/^[ \t]+/, "", $2)
+        gsub(/[ \t\r\n]+$/, "", $2)
+        print $2
+        exit
+    }')
+
+    # Fallback to WWN if no serial
+    if [[ -z "$DRIVE_LABEL" ]]; then
+        DRIVE_LABEL=$(echo "$SERIAL_OUT" | awk -F: '
+        /LU WWN Device Id/ {
+            gsub(/^[ \t]+/, "", $2)
+            gsub(/[ \t]+/, "", $2)
+            print $2
+            exit
+        }')
+    fi
+
+    # Final fallback: device name
     [[ -z "$DRIVE_LABEL" ]] && DRIVE_LABEL=$(basename "$DEV")
 
+    ###############################
     # SMART Health Status
+    ###############################
     if smartctl -H "$DEV" &>/dev/null; then
-        SMART_HEALTH=$(smartctl -H "$DEV" | grep "SMART overall-health" | awk -F: '{gsub(/^[ \t]+/, "", $2); print $2}')
+        SMART_HEALTH=$(smartctl -H "$DEV" | grep -i "SMART overall-health" | awk -F: '{gsub(/^[ \t]+/, "", $2); print $2}')
         [[ -z "$SMART_HEALTH" ]] && SMART_HEALTH="UNKNOWN"
     else
         SMART_HEALTH="NOT SUPPORTED"
     fi
 
-    # Collect dmesg errors for this device
+    ###############################
+    # DMESG Error Detection
+    ###############################
     grep -iE "$DEV|$(basename "$DEV")" /var/log/dmesg 2>/dev/null | \
         grep -iE "error|fail|reset|timeout" > "$TMP_ERROR_LOG"
-    if [[ ! -s $TMP_ERROR_LOG ]]; then
+
+    if [[ ! -s "$TMP_ERROR_LOG" ]]; then
         dmesg | grep -iE "$DEV|$(basename "$DEV")" | \
             grep -iE "error|fail|reset|timeout" > "$TMP_ERROR_LOG"
     fi
+
     DMESG_COUNT=$(wc -l < "$TMP_ERROR_LOG")
 
-    # Print summary line
+    ###############################
+    # Output Summary + Errors
+    ###############################
     SUMMARY_LINE="$DRIVE_LABEL,$DEV,$SMART_HEALTH,$DMESG_COUNT"
     echo "$SUMMARY_LINE" | tee -a "$OUTPUT"
 
-    # If errors found, print them under the summary
     if [[ "$DMESG_COUNT" -gt 0 ]]; then
         echo "---------------" | tee -a "$OUTPUT"
         cat "$TMP_ERROR_LOG" | tee -a "$OUTPUT"
@@ -50,7 +99,5 @@ for DEV in "${DRIVES[@]}"; do
     echo "" | tee -a "$OUTPUT"
 done
 
-# Clean up
 rm -f "$TMP_ERROR_LOG"
-
 echo "Scan complete. Report saved to: $OUTPUT"
